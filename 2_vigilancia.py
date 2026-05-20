@@ -1,3 +1,4 @@
+#%%
 """
 PASO 2: Vigilancia y bloqueo automático
 ========================================
@@ -188,7 +189,10 @@ def main():
                         help="Segundos sin reconocerte antes de bloquear. Default: 5")
     parser.add_argument("--silencio", action="store_true",
                         help="Ejecutar sin ventana visible (modo fondo)")
-    args = parser.parse_args()
+
+    # parse_known_args ignora argumentos desconocidos de Jupyter/IPython
+    # en lugar de lanzar un error al encontrar --f=kernel-xxx.json
+    args, _ = parser.parse_known_args()
 
     log.info("━" * 50)
     log.info("  Face Lock iniciado")
