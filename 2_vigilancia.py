@@ -5,8 +5,8 @@ PASO 2: Vigilancia y bloqueo automático
 Monitorea la cámara continuamente. Solo bloquea el PC
 cuando detecte un rostro que NO sea el tuyo.
 
-Si no hay nadie frente a la cámara, el contador se pausa
-y NO se bloquea.
+Al bloquear, guarda una foto del intruso en la carpeta
+'intrusos/' con fecha y hora.
 
 Uso:
     python 2_vigilancia.py [--tolerancia 0.55] [--segundos 5] [--silencio]
@@ -23,14 +23,15 @@ import pickle
 import time
 import subprocess
 import ctypes
-import os
 import sys
 import argparse
 import logging
 from pathlib import Path
+from datetime import datetime
 
 PERFIL_PATH = "mi_rostro.pkl"
-LOG_PATH = "face_lock.log"
+LOG_PATH    = "face_lock.log"
+FOTOS_DIR   = Path("intrusos")
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -45,11 +46,27 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+# ─── Captura de foto del intruso ──────────────────────────────────────────────
+
+def guardar_foto_intruso(frame):
+    """Guarda el frame actual en la carpeta 'intrusos/' con timestamp."""
+    FOTOS_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    ruta = FOTOS_DIR / f"intruso_{timestamp}.jpg"
+    exito = cv2.imwrite(str(ruta), frame)
+    if exito:
+        log.warning(f"📸 Foto del intruso guardada: {ruta}")
+    else:
+        log.error(f"No se pudo guardar la foto en: {ruta}")
+    return ruta if exito else None
+
+
 # ─── Bloqueo de pantalla (Windows) ────────────────────────────────────────────
 
-def bloquear_pc():
-    """Bloquea la pantalla usando la API nativa de Windows."""
-    log.warning("BLOQUEANDO PC - rostro no autorizado detectado")
+def bloquear_pc(frame):
+    """Guarda foto del intruso y luego bloquea la pantalla."""
+    guardar_foto_intruso(frame)
+    log.warning("🔒 BLOQUEANDO PC - rostro no autorizado detectado")
     try:
         ctypes.windll.user32.LockWorkStation()
     except Exception:
@@ -88,14 +105,16 @@ def vigilar(tolerancia: float, segundos_limite: int, silencioso: bool):
 
     log.info(f"Vigilancia activa | tolerancia={tolerancia} | limite={segundos_limite}s")
     log.info("MODO: bloquea SOLO cuando detecta un rostro no reconocido.")
+    log.info(f"Fotos de intrusos guardadas en: {FOTOS_DIR.resolve()}")
     log.info("Presiona 'q' en la ventana para salir.")
 
-    tiempo_intruso = 0.0       # segundos acumulados con rostro desconocido
-    ultimo_frame = time.time()
-    bloqueado_recientemente = False
+    tiempo_intruso     = 0.0
+    ultimo_frame       = time.time()
+    bloqueado_rec      = False   # evita bloqueos repetidos en el mismo evento
+    ultimo_frame_orig  = None    # frame sin dibujos para guardar foto limpia
 
     INTERVALO_FRAMES = 3
-    contador_frames = 0
+    contador_frames  = 0
 
     while True:
         ret, frame = cap.read()
@@ -104,9 +123,12 @@ def vigilar(tolerancia: float, segundos_limite: int, silencioso: bool):
             continue
 
         contador_frames += 1
-        ahora = time.time()
-        delta = ahora - ultimo_frame
+        ahora  = time.time()
+        delta  = ahora - ultimo_frame
         ultimo_frame = ahora
+
+        # Guardar copia limpia del frame (sin anotaciones) para la foto
+        frame_limpio = frame.copy()
 
         # Mostrar frames intermedios sin procesar (ahorra CPU)
         if contador_frames % INTERVALO_FRAMES != 0:
@@ -118,16 +140,16 @@ def vigilar(tolerancia: float, segundos_limite: int, silencioso: bool):
 
         # ── Detección de rostros ───────────────────────────────────────────
         pequeno = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-        rgb = cv2.cvtColor(pequeno, cv2.COLOR_BGR2RGB)
+        rgb     = cv2.cvtColor(pequeno, cv2.COLOR_BGR2RGB)
 
-        ubicaciones = face_recognition.face_locations(rgb, model="hog")
+        ubicaciones   = face_recognition.face_locations(rgb, model="hog")
         codificaciones = face_recognition.face_encodings(rgb, ubicaciones)
 
-        yo_presente = False
-        intruso_detectado = False  # hay un rostro pero NO es el mío
+        yo_presente      = False
+        intruso_detectado = False
 
         for (ubicacion, codif_encontrada) in zip(ubicaciones, codificaciones):
-            distancia = face_recognition.face_distance([mi_codificacion], codif_encontrada)[0]
+            distancia  = face_recognition.face_distance([mi_codificacion], codif_encontrada)[0]
             reconocido = distancia <= tolerancia
 
             if reconocido:
@@ -137,53 +159,47 @@ def vigilar(tolerancia: float, segundos_limite: int, silencioso: bool):
 
             if not silencioso:
                 top, right, bottom, left = [v * 2 for v in ubicacion]
-                color = (0, 200, 0) if reconocido else (0, 50, 220)
+                color   = (0, 200, 0) if reconocido else (0, 50, 220)
                 etiqueta = f"{'Autorizado' if reconocido else 'No autorizado'} ({1 - distancia:.0%})"
                 cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
                 cv2.putText(frame, etiqueta, (left, top - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
         # ── Lógica de estados ──────────────────────────────────────────────
-        #
-        #   Estado 1 — Yo presente:
-        #       Reiniciar contador. Todo OK.
-        #
-        #   Estado 2 — Rostro desconocido detectado:
-        #       Acumular tiempo. Si supera el límite → bloquear.
-        #
-        #   Estado 3 — Sin ningún rostro en cámara:
-        #       Pausar contador. No bloquear.
-        #       (te fuiste un momento, apagaste la luz, etc.)
-        #
+        #   1. Yo presente          → reiniciar todo
+        #   2. Rostro desconocido   → acumular tiempo, puede bloquear
+        #   3. Sin ningún rostro    → pausar contador
         if yo_presente:
             tiempo_intruso = 0.0
-            bloqueado_recientemente = False
+            bloqueado_rec  = False
 
         elif intruso_detectado:
             tiempo_intruso += delta * INTERVALO_FRAMES
-
-        # else: sin rostro → no modificar el contador
+            # Guardar el frame limpio más reciente con intruso (mejor calidad)
+            ultimo_frame_orig = frame_limpio
 
         # ── Estado en pantalla ─────────────────────────────────────────────
         if not silencioso:
             if yo_presente:
-                estado = "Autorizado"
+                estado      = "Autorizado"
                 color_estado = (0, 200, 0)
             elif intruso_detectado:
-                estado = f"Rostro no reconocido: {tiempo_intruso:.1f}s / {segundos_limite}s"
+                estado      = f"Rostro no reconocido: {tiempo_intruso:.1f}s / {segundos_limite}s"
                 color_estado = (0, 50, 220)
             else:
-                estado = "Sin rostro detectado - en espera"
+                estado      = "Sin rostro detectado - en espera"
                 color_estado = (160, 160, 160)
 
             cv2.putText(frame, estado, (10, frame.shape[0] - 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_estado, 2)
             cv2.imshow("Face Lock - q para salir", frame)
 
-        # ── Disparar bloqueo ───────────────────────────────────────────────
-        if intruso_detectado and tiempo_intruso >= segundos_limite and not bloqueado_recientemente:
-            bloquear_pc()
-            bloqueado_recientemente = True
+        # ── Disparar bloqueo + foto ────────────────────────────────────────
+        if intruso_detectado and tiempo_intruso >= segundos_limite and not bloqueado_rec:
+            # Usar el frame limpio (sin anotaciones) para la foto
+            foto_frame = ultimo_frame_orig if ultimo_frame_orig is not None else frame_limpio
+            bloquear_pc(foto_frame)
+            bloqueado_rec  = True
             tiempo_intruso = 0.0
 
         # ── Salida ─────────────────────────────────────────────────────────
